@@ -1250,6 +1250,35 @@ impl RolloutWriterState {
         Ok(())
     }
 
+    async fn sync_thread_state_from_session_meta_if_needed(&mut self) {
+        if self.state_db_ctx.is_none() {
+            return;
+        }
+        let Some(session_meta) = self.meta.as_ref().cloned() else {
+            return;
+        };
+        if !matches!(session_meta.source, SessionSource::SubAgent(_)) {
+            return;
+        }
+        if let Err(err) = write_session_meta(
+            /*writer*/ None,
+            session_meta,
+            &self.cwd,
+            &self.rollout_path,
+            self.state_db_ctx.as_deref(),
+            &mut self.state_builder,
+            self.default_provider.as_str(),
+            self.generate_memories,
+        )
+        .await
+        {
+            warn!(
+                "failed to prime thread state from session metadata for {}: {err}",
+                self.rollout_path.display()
+            );
+        }
+    }
+
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
         self.ensure_writer_open().await?;
         self.write_session_meta_if_needed().await?;
@@ -1319,6 +1348,7 @@ async fn rollout_writer(
         default_provider,
         generate_memories,
     );
+    state.sync_thread_state_from_session_meta_if_needed().await;
 
     // Process rollout commands
     while let Some(cmd) = rx.recv().await {

@@ -3,11 +3,13 @@
 use super::*;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
+use codex_protocol::AgentPath;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -192,6 +194,63 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
         text.contains("buffered-before-persist"),
         "retry should preserve items buffered before the failed persist"
     );
+
+    recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_recorder_primes_state_db_before_rollout_materializes() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
+        .await
+        .expect("state db should initialize");
+    let thread_id = ThreadId::new();
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            thread_id,
+            /*forked_from_id*/ None,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: Some(AgentPath::try_from("/root/worker").expect("agent path")),
+                agent_nickname: Some("Atlas".to_string()),
+                agent_role: Some("explorer".to_string()),
+            }),
+            BaseInstructions::default(),
+            Vec::new(),
+            EventPersistenceMode::Limited,
+        ),
+        Some(state_db.clone()),
+        /*state_builder*/ None,
+    )
+    .await?;
+
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    assert!(
+        !rollout_path.exists(),
+        "rollout file should stay deferred before the first recordable item"
+    );
+
+    let metadata = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(metadata) = state_db
+                .get_thread(thread_id)
+                .await
+                .expect("thread metadata should load")
+            {
+                break metadata;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("thread metadata should be primed from session metadata");
+    assert_eq!(metadata.agent_nickname, Some("Atlas".to_string()));
+    assert_eq!(metadata.agent_role, Some("explorer".to_string()));
+    assert_eq!(metadata.rollout_path, rollout_path);
 
     recorder.shutdown().await?;
     Ok(())

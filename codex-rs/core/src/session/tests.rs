@@ -248,7 +248,10 @@ async fn regular_turn_emits_turn_started_without_waiting_for_startup_prewarm() {
     .await;
     sess.spawn_task(
         Arc::clone(&tc),
-        Vec::new(),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
         crate::tasks::RegularTask::new(),
     )
     .await;
@@ -284,7 +287,10 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     .await;
     sess.spawn_task(
         Arc::clone(&tc),
-        Vec::new(),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
         crate::tasks::RegularTask::new(),
     )
     .await;
@@ -300,23 +306,83 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    let (turn_id, reason, completed_at, duration_ms) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("channel open");
+                if let EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id,
+                    reason,
+                    completed_at,
+                    duration_ms,
+                }) = event.msg
+                {
+                    break (turn_id, reason, completed_at, duration_ms);
+                }
+            }
+        })
         .await
-        .expect("expected turn aborted event")
-        .expect("channel open");
-    let EventMsg::TurnAborted(TurnAbortedEvent {
-        turn_id,
-        reason,
-        completed_at,
-        duration_ms,
-    }) = second.msg
-    else {
-        panic!("expected turn aborted event");
-    };
+        .expect("expected turn aborted event");
     assert_eq!(turn_id, Some(tc.sub_id.clone()));
     assert_eq!(reason, TurnAbortReason::Interrupted);
     assert!(completed_at.is_some());
     assert!(duration_ms.is_some());
+}
+
+#[tokio::test]
+async fn pending_input_turn_does_not_wait_for_startup_prewarm() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = startup_prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+        ),
+    )
+    .await;
+    sess.queue_response_items_for_next_turn(vec![ResponseInputItem::Message {
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "queued before wake".to_string(),
+        }],
+    }])
+    .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        crate::tasks::RegularTask::new(),
+    )
+    .await;
+
+    timeout(Duration::from_millis(200), async {
+        loop {
+            let history = sess.clone_history().await;
+            if history.raw_items().iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "assistant"
+                            && content.iter().any(|content_item| matches!(
+                                content_item,
+                                ContentItem::InputText { text } if text == "queued before wake"
+                            ))
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pending input should be recorded without waiting for startup prewarm");
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {

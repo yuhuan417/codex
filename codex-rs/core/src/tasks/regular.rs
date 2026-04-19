@@ -52,14 +52,20 @@ impl SessionTask for RegularTask {
         });
         sess.send_event(ctx.as_ref(), event).await;
         sess.set_server_reasoning_included(/*included*/ false).await;
-        let prewarmed_client_session = match sess
-            .consume_startup_prewarm_for_regular_turn(&cancellation_token)
-            .await
-        {
-            SessionStartupPrewarmResolution::Cancelled => return None,
-            SessionStartupPrewarmResolution::Unavailable { .. } => None,
-            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
-                Some(*prewarmed_client_session)
+        // Idle wakeups should not block on startup prewarm before they can
+        // record already-buffered input into history.
+        let prewarmed_client_session = if input.is_empty() {
+            None
+        } else {
+            match sess
+                .consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await
+            {
+                SessionStartupPrewarmResolution::Cancelled => return None,
+                SessionStartupPrewarmResolution::Unavailable { .. } => None,
+                SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
+                    Some(*prewarmed_client_session)
+                }
             }
         };
         let mut next_input = input;
