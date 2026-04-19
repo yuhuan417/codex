@@ -760,6 +760,8 @@ Example request/response:
 
 For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn.
 
+For both inline and detached reviews, treat the `turn.id` returned by `review/start` as the authoritative review turn id. The subsequent `turn/started`, `item/*`, and `turn/completed` notifications for that review use the same turn id.
+
 Codex streams the usual `turn/started` notification followed by an `item/started`
 with an `enteredReviewMode` item so clients can show progress:
 

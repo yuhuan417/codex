@@ -13,7 +13,9 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_utils_template::Template;
 use tokio_util::sync::CancellationToken;
 
@@ -38,12 +40,14 @@ static REVIEW_EXIT_SUCCESS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
         .unwrap_or_else(|err| panic!("review exit success template must parse: {err}"))
 });
 
-#[derive(Clone, Copy)]
-pub(crate) struct ReviewTask;
+#[derive(Clone)]
+pub(crate) struct ReviewTask {
+    review_request: ReviewRequest,
+}
 
 impl ReviewTask {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(review_request: ReviewRequest) -> Self {
+        Self { review_request }
     }
 }
 
@@ -68,6 +72,19 @@ impl SessionTask for ReviewTask {
             /*inc*/ 1,
             &[],
         );
+        let sess = session.clone_session();
+        let turn_started = EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: ctx.sub_id.clone(),
+            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+            model_context_window: ctx.model_context_window(),
+            collaboration_mode_kind: ctx.collaboration_mode.mode,
+        });
+        sess.send_event(ctx.as_ref(), turn_started).await;
+        sess.send_event(
+            ctx.as_ref(),
+            EventMsg::EnteredReviewMode(self.review_request.clone()),
+        )
+        .await;
 
         // Start sub-codex conversation and get the receiver for events.
         let output = match start_review_conversation(
@@ -176,6 +193,9 @@ async fn process_review_events(
                 return None;
             }
             other => {
+                let Some(other) = rewrite_review_event_turn_ids(other, &ctx.sub_id) else {
+                    continue;
+                };
                 session
                     .clone_session()
                     .send_event(ctx.as_ref(), other)
@@ -185,6 +205,89 @@ async fn process_review_events(
     }
     // Channel closed without TurnComplete: treat as interrupted.
     None
+}
+
+fn rewrite_review_event_turn_ids(msg: EventMsg, review_turn_id: &str) -> Option<EventMsg> {
+    match msg {
+        EventMsg::TurnStarted(_) => None,
+        EventMsg::HookStarted(mut event) => {
+            event.turn_id = Some(review_turn_id.to_string());
+            Some(EventMsg::HookStarted(event))
+        }
+        EventMsg::HookCompleted(mut event) => {
+            event.turn_id = Some(review_turn_id.to_string());
+            Some(EventMsg::HookCompleted(event))
+        }
+        EventMsg::ItemStarted(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ItemStarted(event))
+        }
+        EventMsg::ItemCompleted(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ItemCompleted(event))
+        }
+        EventMsg::PlanDelta(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::PlanDelta(event))
+        }
+        EventMsg::ReasoningContentDelta(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ReasoningContentDelta(event))
+        }
+        EventMsg::ReasoningRawContentDelta(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ReasoningRawContentDelta(event))
+        }
+        EventMsg::ExecCommandBegin(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ExecCommandBegin(event))
+        }
+        EventMsg::ExecCommandEnd(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ExecCommandEnd(event))
+        }
+        EventMsg::ExecApprovalRequest(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ExecApprovalRequest(event))
+        }
+        EventMsg::RequestPermissions(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::RequestPermissions(event))
+        }
+        EventMsg::RequestUserInput(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::RequestUserInput(event))
+        }
+        EventMsg::DynamicToolCallRequest(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::DynamicToolCallRequest(event))
+        }
+        EventMsg::DynamicToolCallResponse(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::DynamicToolCallResponse(event))
+        }
+        EventMsg::ElicitationRequest(mut event) => {
+            event.turn_id = Some(review_turn_id.to_string());
+            Some(EventMsg::ElicitationRequest(event))
+        }
+        EventMsg::ApplyPatchApprovalRequest(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::ApplyPatchApprovalRequest(event))
+        }
+        EventMsg::GuardianAssessment(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::GuardianAssessment(event))
+        }
+        EventMsg::PatchApplyBegin(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::PatchApplyBegin(event))
+        }
+        EventMsg::PatchApplyEnd(mut event) => {
+            event.turn_id = review_turn_id.to_string();
+            Some(EventMsg::PatchApplyEnd(event))
+        }
+        other => Some(other),
+    }
 }
 
 /// Parse a ReviewOutputEvent from a text blob returned by the reviewer model.

@@ -34,7 +34,7 @@ use uuid::Uuid;
 use wiremock::MockServer;
 
 /// Verify that submitting `Op::Review` spawns a child task and emits
-/// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
+/// TurnStarted -> EnteredReviewMode -> ExitedReviewMode(Some(review)) -> TurnComplete
 /// in that order when the model returns a structured review JSON payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_op_emits_lifecycle_and_review_output() {
@@ -88,7 +88,8 @@ async fn review_op_emits_lifecycle_and_review_output() {
         .await
         .unwrap();
 
-    // Verify lifecycle: Entered -> Exited(Some(review)) -> TurnComplete.
+    // Verify lifecycle: TurnStarted -> Entered -> Exited(Some(review)) -> TurnComplete.
+    let _started = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnStarted(_))).await;
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {

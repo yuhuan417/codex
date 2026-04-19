@@ -18,11 +18,14 @@ use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use pretty_assertions::assert_eq;
@@ -85,6 +88,17 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     assert_eq!(review_thread_id, thread_id.clone());
     let turn_id = turn.id.clone();
     assert_eq!(turn.status, TurnStatus::InProgress);
+    let started: TurnStartedNotification = serde_json::from_value(
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/started"),
+        )
+        .await??
+        .params
+        .expect("turn/started params must be present"),
+    )?;
+    assert_eq!(started.thread_id, review_thread_id);
+    assert_eq!(started.turn.id, turn_id);
 
     // Confirm we see the EnteredReviewMode marker on the main thread.
     let mut saw_entered_review_mode = false;
@@ -140,6 +154,82 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
 }
 
 #[tokio::test]
+async fn review_start_thread_read_keeps_command_execution_on_review_turn() -> Result<()> {
+    let responses = vec![
+        create_shell_command_sse_response(
+            vec![
+                "git".to_string(),
+                "rev-parse".to_string(),
+                "HEAD".to_string(),
+            ],
+            /*workdir*/ None,
+            Some(5000),
+            "review-call-1",
+        )?,
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = create_mock_responses_server_sequence(responses).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp, /*persist_extended_history*/ true).await?;
+
+    let review_req = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id: thread_id.clone(),
+            delivery: Some(ReviewDelivery::Inline),
+            target: ReviewTarget::Custom {
+                instructions: "run review commands".to_string(),
+            },
+        })
+        .await?;
+    let review_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
+    )
+    .await??;
+    let ReviewStartResponse { turn, .. } = to_response::<ReviewStartResponse>(review_resp)?;
+    let turn_id = turn.id;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let thread_read_req = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id,
+            include_turns: true,
+        })
+        .await?;
+    let thread_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_read_req)),
+    )
+    .await??;
+    let ThreadReadResponse { thread } = to_response::<ThreadReadResponse>(thread_read_resp)?;
+    let review_turn = thread
+        .turns
+        .iter()
+        .find(|candidate| candidate.id == turn_id)
+        .expect("review turn should be present in thread/read response");
+    assert!(
+        review_turn.items.iter().any(|item| matches!(
+            item,
+            ThreadItem::CommandExecution { id, .. } if id == "review-call-1"
+        )),
+        "review turn should retain the command execution item"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "TODO(owenlin0): flaky"]
 async fn review_start_exec_approval_item_id_matches_command_execution_item() -> Result<()> {
     let responses = vec![
@@ -163,11 +253,11 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let thread_id = start_default_thread(&mut mcp).await?;
+    let thread_id = start_thread(&mut mcp, /*persist_extended_history*/ true).await?;
 
     let review_req = mcp
         .send_review_start_request(ReviewStartParams {
-            thread_id,
+            thread_id: thread_id.clone(),
             delivery: Some(ReviewDelivery::Inline),
             target: ReviewTarget::Commit {
                 sha: "1234567deadbeef".to_string(),
@@ -221,6 +311,30 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let thread_read_req = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id,
+            include_turns: true,
+        })
+        .await?;
+    let thread_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_read_req)),
+    )
+    .await??;
+    let ThreadReadResponse { thread } = to_response::<ThreadReadResponse>(thread_read_resp)?;
+    let review_turn = thread
+        .turns
+        .iter()
+        .find(|candidate| candidate.id == turn_id)
+        .expect("review turn should be present in thread/read response");
+    assert!(
+        review_turn.items.iter().any(|item| matches!(
+            item,
+            ThreadItem::CommandExecution { id, .. } if id == "review-call-1"
+        )),
+        "review turn should retain the command execution item"
+    );
 
     Ok(())
 }
@@ -329,6 +443,17 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let started: ThreadStartedNotification =
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(started.thread.id, review_thread_id);
+    let turn_started: TurnStartedNotification = serde_json::from_value(
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/started"),
+        )
+        .await??
+        .params
+        .expect("turn/started params must be present"),
+    )?;
+    assert_eq!(turn_started.thread_id, review_thread_id);
+    assert_eq!(turn_started.turn.id, turn.id);
 
     Ok(())
 }
@@ -406,9 +531,14 @@ async fn review_start_rejects_empty_custom_instructions() -> Result<()> {
 }
 
 async fn start_default_thread(mcp: &mut McpProcess) -> Result<String> {
+    start_thread(mcp, /*persist_extended_history*/ false).await
+}
+
+async fn start_thread(mcp: &mut McpProcess, persist_extended_history: bool) -> Result<String> {
     let thread_req = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            persist_extended_history,
             ..Default::default()
         })
         .await?;
